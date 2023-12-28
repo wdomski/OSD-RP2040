@@ -1,0 +1,3 @@
+[submodule "ext/STM32Libs"]
+	path = ext/STM32Libs
+	url = git@github.com:wdomski/STM32Libs.git
