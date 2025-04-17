@@ -8,6 +8,11 @@
 
 #include "eprintfs.h"
 #include "fonts.h"
+#include "fonts_utils.h"
+#include "osd.h"
+#include "osd-comm.h"
+#include "osd-param.h"
+#include "utils.h"
 
 #include "i2c-slave.h"
 
@@ -24,19 +29,10 @@ dma_channel_config dma_config;
 const uint8_t OSD_mosi_pin = 15; // 19- spi0
 int ret;
 
-uint8_t line_top_1[80 * 8];
-uint8_t line_top_2[80 * 8];
-uint8_t line_bottom_1[80 * 8];
-uint8_t line_bottom_2[80 * 8];
-
-uint8_t *line_buffers[] =
-    {line_top_1, line_top_2, line_bottom_1, line_bottom_2};
+#define OSD_LINE_TOP_1 35
+#define OSD_LINE_BOTTOM_1 215
 
 uint8_t buffer[1024] = {0x55, 0xff, 0xff};
-
-#define LINE_SATRT_OFFSET 10
-volatile uint32_t line_lengths[4];
-uint32_t line_starts[4] = {35 + LINE_SATRT_OFFSET, 45 + LINE_SATRT_OFFSET, 200 + LINE_SATRT_OFFSET, 210 + LINE_SATRT_OFFSET};
 
 volatile int flag;
 volatile uint32_t sync_pulse;
@@ -59,15 +55,14 @@ void isr_frame_gpio(void);
 
 void isr_line_gpio(void);
 
-void start_dma_transfer(void *spi, void *dma,
-                        uint8_t *buffer, uint32_t length, uint32_t current_line,
-                        uint32_t start_line);
+void start_dma_transfer_line(void *spi, void *dma,
+    uint8_t *buffer, uint32_t length);
 
 void isr_dma_handler(void);
 
 volatile int flag;
 
-bool timer_line_callback(struct repeating_timer *t);
+void fill_with_blanks(uint8_t *buffer, int32_t length);
 
 struct repeating_timer timer;
 uint32_t previous_osd_state;
@@ -75,6 +70,13 @@ uint32_t previous_osd_state;
 absolute_time_t current_time;
 absolute_time_t last_time_osd;
 absolute_time_t last_time_osd_enabled;
+absolute_time_t last_time_stats;
+
+uint8_t stats_counter;
+
+int osd_params_screen_cleaned;
+
+uint8_t osd_param_format[128];
 
 int main()
 {
@@ -105,7 +107,7 @@ int main()
     // SPI configuration to dispatch lines on screen
     ret = spi_init(OSD_spi, 11 * 1000 * 1000);
 
-    spi_set_format(OSD_spi, 8, SPI_CPOL_1, SPI_CPHA_0, SPI_MSB_FIRST);
+    spi_set_format(OSD_spi, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
 
     gpio_set_function(OSD_mosi_pin, GPIO_FUNC_SPI);
 
@@ -118,14 +120,6 @@ int main()
     irq_set_exclusive_handler(DMA_IRQ_0, isr_dma_handler);
     irq_set_enabled(DMA_IRQ_0, true);
 
-    // line width is 50 characters
-    for (int i = 0; i < 4; ++i)
-    {
-        line_lengths[i] = esprintf((char *)buffer,
-                                   "                                                  ");
-        font_print_line((uint8_t *)font_small, buffer, line_lengths[i], line_buffers[i]);
-    }
-
     gpio_add_raw_irq_handler(FRAME_GPIO_Pin, isr_frame_gpio);
     gpio_add_raw_irq_handler(LINE_GPIO_Pin, isr_line_gpio);
     gpio_set_irq_enabled(FRAME_GPIO_Pin, FRAME_Event, true);
@@ -135,23 +129,170 @@ int main()
     while (1)
     {
         current_time = get_absolute_time();
+        if (absolute_time_diff_us(last_time_stats, current_time) > 400000)
+        {
+            last_time_stats = current_time;
+            printf("Frame: %d, OSD: %d\r\n Batt: %d.%02d, T %02ld:%02ld:%02ld SAT: %2d\r\n Param: %d, Index: %d, Value: %ld\r\n", 
+                    stats_counter++,
+                    osd_data->osd_enabled,
+                    osd_data->battery / 1000, (osd_data->battery % 1000) / 10,
+                    OSD_REG_GPS_TIME / 10000, OSD_REG_GPS_TIME % 10000 / 100, OSD_REG_GPS_TIME % 100,
+                                    OSD_REG_GPS_SAT_NUMBER,
+                   osd_data->param_config.mode, osd_data->param_config.index, osd_data->param_config.value);
+        }
+        current_time = get_absolute_time();
         if (absolute_time_diff_us(last_time_osd, current_time) > 100000)
         {
             last_time_osd = current_time;
 
-            line_lengths[0] = esprintf((char *)buffer, "  BATT: %2d.%02dV RSSI: %3d AD: %3d T %02d:%02d:%02d      ",
-                                       OSD_REG_BATTERY / 1000, (OSD_REG_BATTERY % 1000) / 10, OSD_REG_RSSI,
-                                       OSD_REG_NAV_HOME_ANGLE_DEVIATION,
-                                       OSD_REG_GPS_TIME / 10000, OSD_REG_GPS_TIME % 10000 / 100, OSD_REG_GPS_TIME % 100);
-            font_print_line((uint8_t *)font_small, buffer, line_lengths[0], line_buffers[0]);
+            uint32_t line_length;
 
-            line_lengths[2] = esprintf((char *)buffer,
-                                       "  ALT: %4d.%d VEL: %3d.%d DIST: %5d.%d DIST G: %5d.%d      ",
-                                       OSD_REG_GPS_ALTITUDE / 1000, (OSD_REG_GPS_ALTITUDE % 1000) / 100,
+            line_length = esprintf((char *)buffer, "T %02d:%02d:%02d SAT: %2d",
+                                    OSD_REG_GPS_TIME / 10000, OSD_REG_GPS_TIME % 10000 / 100, OSD_REG_GPS_TIME % 100,
+                                    OSD_REG_GPS_SAT_NUMBER);                                
+            fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+            font_print_line((uint8_t *)font_small, buffer, line_length, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, OSD_LINE_TOP_1));
+
+            switch (osd_data->param_config.mode)
+            {
+            case 0:
+            {
+                if(osd_params_screen_cleaned == 0){
+                    // clear screen for params
+                    fill_with_blanks(buffer, OSD_LINE_LENGTH);
+                    font_print_line((uint8_t *)font_small, buffer, OSD_LINE_LENGTH, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, 100));
+                    font_print_line((uint8_t *)font_small, buffer, OSD_LINE_LENGTH, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, 110));
+                    osd_params_screen_cleaned = 1;
+                }
+                break;
+            }
+            case 1:
+            {
+                osd_params_screen_cleaned = 0;
+                if (osd_data->param_config.index < OSD_PARAM_COUNT)
+                {
+                    const char *param_name = osd_param_names[osd_data->param_config.index];
+                    line_length = esprintf((char *)buffer, "%s (%d)  ", param_name, osd_data->param_config.index);
+                    fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+                    font_print_line((uint8_t *)font_small, buffer, OSD_LINE_LENGTH, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, 100));
+                    int fraction = osd_param_fraction[osd_data->param_config.index];
+                    uint8_t sign = osd_data->param_config.value < 0 ? '-' : ' ';
+                    if (fraction > 1)
+                    {
+                        uint8_t power = 1;
+                        int tmp = fraction;
+                        for(int i = 0; i< 5; ++i)
+                        {
+                            tmp /= 10;
+                            if(tmp == 1){
+                                break;
+                            }
+                            ++power;
+                        }
+                        esprintf((char *) osd_param_format, "     %%c%%d.%%0%dd       ", power);
+                        line_length = esprintf((char *)buffer, (const char *)osd_param_format, sign, abs_int32(osd_data->param_config.value / fraction), abs_int32(osd_data->param_config.value % fraction));
+                    }
+                    else
+                    {
+                        line_length = esprintf((char *)buffer, "     %d", osd_data->param_config.value);
+                    }
+                    fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+                    font_print_line((uint8_t *)font_small, buffer, OSD_LINE_LENGTH, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, 110));
+                }
+                else
+                {
+                    line_length = esprintf((char *)buffer, "    PARAM NOT FOUND (%d)  ", osd_data->param_config.index);
+                    fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+                    font_print_line((uint8_t *)font_small, buffer, OSD_LINE_LENGTH, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, 100));
+                    line_length = 0;
+                    fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+                    font_print_line((uint8_t *)font_small, buffer, OSD_LINE_LENGTH, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, 110));                    
+                }
+
+                break;
+            }
+            case 2:
+            {
+                osd_params_screen_cleaned = 0;
+                if (osd_data->param_config.index < OSD_PARAM_COUNT)
+                {
+                    const char *param_name = osd_param_names[osd_data->param_config.index];
+                    line_length = esprintf((char *)buffer, "%s (%d)  ", param_name, osd_data->param_config.index);
+                    fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+                    font_print_line((uint8_t *)font_small, buffer, OSD_LINE_LENGTH, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, 100));
+                    int fraction = osd_param_fraction[osd_data->param_config.index];
+                    if (fraction > 1)
+                    {
+                        uint8_t power = 1;
+                        int tmp = fraction;
+                        for(int i = 0; i< 5; ++i)
+                        {
+                            tmp /= 10;
+                            if(tmp == 1){
+                                break;
+                            }
+                            ++power;
+                        }
+                        esprintf((char *) osd_param_format, ">>>  %%c%%d.%%0%dd       ", power);                        
+                        uint8_t sign = osd_data->param_config.value < 0 ? '-' : ' ';
+                        line_length = esprintf((char *)buffer, (const char *)osd_param_format, sign, abs_int32(osd_data->param_config.value / fraction), abs_int32(osd_data->param_config.value % fraction));
+                    }
+                    else
+                    {
+                        line_length = esprintf((char *)buffer, ">>>  %d", osd_data->param_config.value);
+                    }
+                    fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+                    font_print_line((uint8_t *)font_small, buffer, OSD_LINE_LENGTH, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, 110));                    
+                }
+                else
+                {
+                    line_length = esprintf((char *)buffer, "    PARAM NOT FOUND (%d)  ", osd_data->param_config.index);
+                    fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+                    font_print_line((uint8_t *)font_small, buffer, OSD_LINE_LENGTH, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, 100));
+                    line_length = 0;
+                    fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+                    font_print_line((uint8_t *)font_small, buffer, OSD_LINE_LENGTH, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, 110));
+                }
+            }
+
+            default:
+                break;
+            }
+
+            line_length = esprintf((char *)buffer, "%2d.%02dV",
+                                   OSD_REG_BATTERY / 1000, (OSD_REG_BATTERY % 1000) / 10);
+            font_print_line_scale((uint8_t *)font_small, buffer, line_length, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS + 50, get_line(frame_buffer, 180), 2, 2);
+            line_length = esprintf((char *)buffer, "R %3d ",
+                                   OSD_REG_RSSI);
+            font_print_line_scale((uint8_t *)font_small, buffer, line_length, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS + 50, get_line(frame_buffer, 200), 2, 2);
+            line_length = esprintf((char *)buffer, "A %3d ",
+                                   OSD_REG_NAV_HOME_ANGLE_DEVIATION);
+            font_print_line_scale((uint8_t *)font_small, buffer, line_length, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS + 50, get_line(frame_buffer, 220), 2, 2);
+
+            if(OSD_REG_AUTOPILOT_ENABLED == 0){
+                line_length = esprintf((char *)buffer, "MODE: MANUAL               ");
+            }
+            else{
+                line_length = esprintf((char *)buffer, "MODE: AUTO CTRL: %3d.%d", 
+                                        OSD_REG_CTRL_SIGNAL / 1000, (OSD_REG_CTRL_SIGNAL % 1000) / 100);
+            }
+            // fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+            font_print_line((uint8_t *)font_small, buffer, line_length, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, OSD_LINE_BOTTOM_1-30));            
+
+            line_length = esprintf((char *)buffer,
+                                       "VVEL: %3d.%d ALT: %4d.%d  ",
+                                       OSD_REG_VERTICAL_SPEED / 1000, (OSD_REG_VERTICAL_SPEED % 1000) / 100,
+                                       OSD_REG_GPS_ALTITUDE / 1000, (OSD_REG_GPS_ALTITUDE % 1000) / 100);
+            // fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+            font_print_line((uint8_t *)font_small, buffer, line_length, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, OSD_LINE_BOTTOM_1-20));            
+
+            line_length = esprintf((char *)buffer,
+                                       "VEL: %3d.%d DIST: %5d.%d DIST G: %5d.%d      ",
                                        OSD_REG_GPS_VELOCITY / 1000, (OSD_REG_GPS_VELOCITY % 1000) / 100,
                                        OSD_REG_GPS_DISTANCE / 1000, (OSD_REG_GPS_DISTANCE % 1000) / 100,
                                        OSD_REG_GPS_DISTANCE_ON_GROUND / 1000, (OSD_REG_GPS_DISTANCE_ON_GROUND % 1000) / 100);
-            font_print_line((uint8_t *)font_small, buffer, line_lengths[2], line_buffers[2]);
+            fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+            font_print_line((uint8_t *)font_small, buffer, line_length, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, OSD_LINE_BOTTOM_1-10));
 
             int32_t latitude = OSD_REG_GPS_LATITUDE;
             uint8_t latitude_sign = 'N';
@@ -167,13 +308,13 @@ int main()
                 longitude_sign = 'W';
                 longitude = -longitude;
             }
-            line_lengths[3] = esprintf((char *)buffer,
-                                       "  LAT: %2d.%06d %c LONG: %3d.%06d %c HEAD: %3d      ",
+            line_length = esprintf((char *)buffer,
+                                       "LAT: %2d.%06d %c LONG: %3d.%06d %c HEAD: %3d   ",
                                        latitude / 1000000, latitude % 1000000, latitude_sign,
                                        longitude / 1000000, longitude % 1000000, longitude_sign,
                                        OSD_REG_GPS_HEADING);
-
-            font_print_line(font_small[0], buffer, line_lengths[3], line_buffers[3]);
+            fill_with_blanks(buffer + line_length, OSD_LINE_LENGTH - line_length);
+            font_print_line(font_small[0], buffer, line_length, OSD_LINE_LENGTH, FRAME_BUFFER_X_OFFSET_CHARS, get_line(frame_buffer, OSD_LINE_BOTTOM_1));
         }
 
         current_time = get_absolute_time();
@@ -202,30 +343,6 @@ int main()
     }
 }
 
-bool timer_line_callback(struct repeating_timer *t)
-{
-    gpio_xor_mask(1 << LED_PIN);
-    uint8_t state = gpio_get(LINE_GPIO_Pin);
-    ++line_counter;
-
-    for (int i = 0; i < 4; ++i)
-    {
-        if (line_counter >= line_starts[i] && line_counter < line_starts[i] + 8)
-        {
-            // the order is no coincidence
-            // first start DMA transfer and then use dimming
-            // otherwise the sync can be lost
-            start_dma_transfer(OSD_spi, (void *)dma_spi_tx, line_buffers[i],
-                               line_lengths[i], line_counter, line_starts[i]);
-        }
-        else
-        {
-            // gpio_set_dir(DIM_PIN, GPIO_IN);
-        }
-    }
-    return true;
-}
-
 void isr_frame_gpio(void)
 {
     if (gpio_get_irq_event_mask(FRAME_GPIO_Pin) & FRAME_Event)
@@ -245,30 +362,17 @@ void isr_line_gpio(void)
         gpio_acknowledge_irq(LINE_GPIO_Pin, LINE_Event);
 
         gpio_xor_mask(1 << LED_PIN);
-        uint8_t state = gpio_get(LINE_GPIO_Pin);
-        ++line_counter;
 
-        for (int i = 0; i < 4; ++i)
-        {
-            if (line_counter >= line_starts[i] && line_counter < line_starts[i] + 8)
-            {
-                // the order is no coincidence
-                // first start DMA transfer and then use dimming
-                // otherwise the sync can be lost
-                start_dma_transfer(OSD_spi, (void *)dma_spi_tx, line_buffers[i],
-                                   line_lengths[i], line_counter, line_starts[i]);
-            }
-            else
-            {
-                // gpio_set_dir(DIM_PIN, GPIO_IN);
-            }
+        if(line_counter >= FRAME_BUFFER_Y_OFFSET_LINES && line_counter < FRAME_BUFFER_Y_OFFSET_LINES + OSD_LINES){
+            int offset = (line_counter - FRAME_BUFFER_Y_OFFSET_LINES ) * OSD_LINE_LENGTH;
+            start_dma_transfer_line(OSD_spi, (void *)dma_spi_tx, &frame_buffer[offset], OSD_LINE_LENGTH);
         }
+        ++line_counter;
     }
 }
 
-void start_dma_transfer(void *spi, void *dma,
-                        uint8_t *buffer, uint32_t length, uint32_t current_line,
-                        uint32_t start_line)
+void start_dma_transfer_line(void *spi, void *dma,
+                        uint8_t *buffer, uint32_t length)
 {
     if (!dma_channel_is_busy(dma_spi_tx))
     {
@@ -278,7 +382,7 @@ void start_dma_transfer(void *spi, void *dma,
         gpio_put(DIM_PIN, 0);
 
         gpio_set_function(OSD_mosi_pin, GPIO_FUNC_SPI);
-        dma_channel_configure((uint)dma, &dma_config, &spi_get_hw((spi_inst_t *)spi)->dr, (buffer + length * (current_line % start_line)), length, true);
+        dma_channel_configure((uint)dma, &dma_config, &spi_get_hw((spi_inst_t *)spi)->dr, buffer, length, true);
     }
 }
 

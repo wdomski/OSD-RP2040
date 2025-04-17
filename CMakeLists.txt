@@ -12,13 +12,20 @@ add_executable(osd
     src/main.c
     src/fonts.c
     ext/STM32Libs/eprintfs/eprintfs.c
+    ext/STM32Libs/utils/utils.c
     src/i2c-slave.c
+    src/fonts_utils.c
+    src/osd.c
+    src/osd-comm.c
+    src/osd-param.c
+    src/osd-i2c-ctrl.c
 )
 
 target_include_directories(osd 
 PUBLIC
 inc
-ext/STM32Libs/eprintfs)
+ext/STM32Libs/eprintfs
+ext/STM32Libs/utils)
 
 target_compile_options(osd 
 PUBLIC 

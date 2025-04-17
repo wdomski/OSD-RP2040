@@ -9,17 +9,6 @@
 
 #include "fonts.h"
 
-void font_print_line( uint8_t * font, uint8_t * input, uint32_t input_length, uint8_t * buffer){
-	uint8_t sign;
-	for(int i = 0; i < 8; ++i)
-	{
-		for(int j = 0; j < input_length; ++j){
-			sign = input[j];
-			*(buffer + i * input_length + j) = (font+8*sign)[i];
-		}
-	}
-}
-
 uint8_t font_small[][8] = {
 // 0x0
 {

@@ -12,7 +12,4 @@
 
 extern uint8_t font_small[][8];
 
-void font_print_line(uint8_t *font, uint8_t *input, uint32_t input_length,
-		uint8_t *buffer);
-
 #endif /* INC_FONTS_H_ */
